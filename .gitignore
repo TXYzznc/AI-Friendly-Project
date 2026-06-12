@@ -1,0 +1,60 @@
+# Unity generated folders
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+
+# 自定义 Console 日志导出目录（ConsoleLogExporterPanel）
+输出日志/
+
+# Unity build outputs
+[Bb]uild/
+[Bb]uilds/
+[Aa]ssets/AssetStoreTools*
+[Ss]erver[Dd]ata/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# Visual Studio / Rider generated project files
+.vs/
+.idea/
+*.csproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# Unity generated debug/meta artifacts
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+sysinfo.txt
+*.stackdump
+crashlytics-build.properties
+
+# Build/package artifacts
+*.apk
+*.aab
+*.unitypackage
+*.app
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Keep shared VS Code workspace config, ignore local extras.
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/extensions.json

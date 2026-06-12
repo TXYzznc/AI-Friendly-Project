@@ -1,0 +1,237 @@
+# 设计方案 - 01.配置表系统
+
+> 关联：[策划案.md](../../1.策划/01.配置表系统/策划案.md) | [需求.md](../../2.需求列表/01.配置表系统/需求.md)
+
+---
+
+## 一、整体数据流
+
+```
+Assets/Resources/DataTable/{TableName}.json   ← AI 编辑的源文件 = 运行时资源
+            │
+            │  (Editor 菜单触发，手动步骤)
+            ▼
+   DataTableGenerator (Editor 工具)
+            │
+            ▼
+Assets/Scripts/DataTable/{TableName}.cs        ← 生成的 Row 类 + Table 容器类
+Assets/Scripts/DataTable/DataTableRegistry.cs  ← 汇总所有表的注册信息
+            │
+            │  (运行时)
+            ▼
+   DataTableModule.InitializeAsync()
+     - 遍历 DataTableRegistry.Entries
+     - Resources.LoadAsync<TextAsset>(...)
+     - Activator.CreateInstance(TableType) + table.Load(json)
+            │
+            ▼
+   业务模块: GetModule<DataTableModule>().GetTable<ItemTable>().GetById(1001)
+```
+
+---
+
+## 二、JSON 源文件格式规范
+
+文件路径：`Assets/Resources/DataTable/{TableName}.json`
+
+```json
+{
+  "table": "ItemTable",
+  "fields": [
+    { "name": "Id",     "type": "int",    "desc": "唯一标识，主键" },
+    { "name": "Name",   "type": "string", "desc": "物品名称" },
+    { "name": "IconId", "type": "int",    "desc": "图标资源ID" },
+    { "name": "Tags",   "type": "int[]",  "desc": "标签数组" }
+  ],
+  "rows": [
+    { "Id": 1001, "Name": "治疗药水", "IconId": 2001, "Tags": [1, 2] },
+    { "Id": 1002, "Name": "魔法药水", "IconId": 2002, "Tags": [] }
+  ]
+}
+```
+
+### 规则
+- `table` 字段值必须与文件名（去掉 `.json`）一致，生成器据此命名生成的类
+- `fields` 是有序数组：
+  - `fields[0]` 必须是 `{ "name": "Id", "type": "int", ... }`（主键约定，Table 容器用它建立索引）
+  - `name` 必须是合法 C# 标识符（PascalCase 推荐，因为会直接作为生成属性名）
+  - `type` 必须在「支持的类型」列表中
+- `rows` 中每个对象的 key 必须是 `fields` 中声明过的 `name`；缺失的 key 由生成的 Row 类按类型默认值处理（Newtonsoft 反序列化时未出现的属性保持 C# 默认值：`0` / `null`→需注意 string 默认是 null 不是 ""，详见下方"已知细节"）
+- AI 编辑时只需关注 `fields`（改表结构）和 `rows`（改数据），两者在同一文件中
+
+### 支持的类型与 C# 映射
+
+| JSON `type` | 生成的 C# 属性类型 |
+|---|---|
+| `int` | `int` |
+| `float` | `float` |
+| `double` | `double` |
+| `string` | `string` |
+| `bool` | `bool` |
+| `int[]` | `int[]` |
+| `float[]` | `float[]` |
+| `string[]` | `string[]` |
+
+生成器遇到列表之外的 `type` → 报错并中止生成（`FrameworkLogger.Error` + 抛异常），不静默忽略。
+
+### 已知细节：string 默认值
+Newtonsoft 反序列化时，JSON 中缺失的 `string` 字段会保持 C# 默认值 `null`，而不是 `""`。业务代码读取 `string` 字段时如果需要拼接显示，应自行做 `?? ""` 处理，或在 `rows` 中始终显式写 `""`。本设计不在生成器里做额外的"空值填充"，保持生成器逻辑简单。
+
+---
+
+## 三、框架机制代码（Assets/Scripts/Modules/DataTable/）
+
+### 3.1 `IDataTable.cs`
+```csharp
+public interface IDataTable
+{
+    void Load(string json);
+}
+```
+每个生成的 Table 容器类实现此接口，由 `DataTableModule` 统一调用。
+
+### 3.2 `DataTableFile.cs`
+```csharp
+public sealed class DataTableFile<TRow>
+{
+    public List<TRow> rows;
+}
+```
+运行时只关心 `rows`；JSON 中的 `table`/`fields` 字段会被 Newtonsoft 自动忽略（目标类型无对应成员时默认忽略，不报错）。
+
+### 3.3 `DataTableModule.cs`
+```csharp
+public sealed class DataTableModule : IGameModule
+{
+    public int ModuleCategory => 0;
+    public Type[] Dependencies => Type.EmptyTypes;
+
+    readonly Dictionary<Type, IDataTable> _tables = new();
+
+    public async UniTask InitializeAsync(CancellationToken ct = default)
+    {
+        foreach (var entry in DataTableRegistry.Entries)
+        {
+            var asset = await Resources.LoadAsync<TextAsset>($"DataTable/{entry.FileName}")
+                .ToUniTask(cancellationToken: ct) as TextAsset;
+
+            if (asset == null)
+                throw new InvalidOperationException($"配置表资源未找到: DataTable/{entry.FileName}");
+
+            var table = (IDataTable)Activator.CreateInstance(entry.TableType);
+            table.Load(asset.text);
+            _tables[entry.TableType] = table;
+
+            FrameworkLogger.Info("DataTableModule",
+                $"Action=TableLoaded Table={entry.TableType.Name} File={entry.FileName}");
+        }
+    }
+
+    public UniTask ShutdownAsync(CancellationToken ct = default)
+    {
+        _tables.Clear();
+        return UniTask.CompletedTask;
+    }
+
+    public T GetTable<T>() where T : IDataTable
+    {
+        if (_tables.TryGetValue(typeof(T), out var table))
+            return (T)table;
+        throw new KeyNotFoundException($"配置表 {typeof(T).Name} 未加载");
+    }
+}
+```
+
+**时序说明**：`ModuleCategory = 0` 且 `Dependencies` 为空，`ModuleRunner` 会尽早并行初始化它。其他 Category 0 模块若需要在自己的 `InitializeAsync` 中读表，必须把 `DataTableModule` 加入自己的 `Dependencies`。
+
+---
+
+## 四、生成器（Assets/Scripts/Modules/DataTable/Editor/DataTableGenerator.cs）
+
+### 4.1 触发方式
+Unity 菜单：`Tools/DataTable/生成全部配置表代码`（`[MenuItem]`），手动触发——符合 CLAUDE.md "配置表更新需运行生成器，先通知用户"的约定。
+
+### 4.2 处理流程
+1. `Directory.GetFiles("Assets/Resources/DataTable", "*.json")`
+2. 对每个文件：
+   - 用 Newtonsoft 解析为通用结构（`JObject`），读取 `table` 和 `fields`
+   - 校验：
+     - `table` == 文件名（不含扩展名），否则报错
+     - `fields[0].name == "Id"` 且 `fields[0].type == "int"`，否则报错
+     - 每个 `fields[i].name` 是合法 C# 标识符
+     - 每个 `fields[i].type` 在支持列表内
+   - 生成 `{TableName}Row` 类（公开自动属性，按 `fields` 顺序）
+   - 生成 `{TableName}` 类（实现 `IDataTable`，内部 `Dictionary<int, {TableName}Row>`，构造时按 `Id` 建索引）
+   - 写入 `Assets/Scripts/DataTable/{TableName}.cs`，文件头加 `// <auto-generated> 不要手改`
+3. 汇总所有表，生成 `Assets/Scripts/DataTable/DataTableRegistry.cs`：
+   ```csharp
+   public static class DataTableRegistry
+   {
+       public static readonly DataTableEntry[] Entries =
+       {
+           new DataTableEntry("ItemTable", typeof(ItemTable)),
+           // ... 其他表
+       };
+   }
+
+   public readonly struct DataTableEntry
+   {
+       public readonly string FileName;
+       public readonly Type TableType;
+
+       public DataTableEntry(string fileName, Type tableType)
+       {
+           FileName = fileName;
+           TableType = tableType;
+       }
+   }
+   ```
+4. `AssetDatabase.Refresh()` 触发重新编译
+
+### 4.3 幂等性
+生成器每次运行都是"全量重新生成"，不做增量 diff，不读取已有生成文件的内容——保证结果确定、可重复。
+
+---
+
+## 五、示例表：ItemTable
+
+`Assets/Resources/DataTable/ItemTable.json`（见第二节示例），字段：`Id / Name / IconId / Tags`，3 行示例数据。
+
+用于验证完整链路：编辑 JSON → 运行生成器 → `ItemTable.cs` + `DataTableRegistry.cs` 生成 → `GameApp` 注册 `DataTableModule` → `GetTable<ItemTable>().GetById(1001)` 返回正确数据。
+
+---
+
+## 六、GameApp 接入
+
+```csharp
+_runner.AddModule(new DataTableModule());
+```
+加入 [GameApp.cs](../../../Assets/Scripts/Core/GameApp.cs) 的模块注册列表（替换现有 TODO 注释）。
+
+---
+
+## 七、目录结构汇总
+
+```
+Assets/
+├── Resources/DataTable/
+│   └── ItemTable.json                 ← AI 编辑（新建/修改表结构和数据）
+└── Scripts/
+    ├── DataTable/                     ← 生成产物，不要手改
+    │   ├── ItemTable.cs
+    │   └── DataTableRegistry.cs
+    └── Modules/DataTable/
+        ├── IDataTable.cs
+        ├── DataTableFile.cs
+        ├── DataTableModule.cs
+        └── Editor/
+            └── DataTableGenerator.cs
+```
+
+---
+
+## 八、不在本次范围内
+- xlsx/Excel 流程
+- 按需/异步分表加载
+- 表间引用校验（如 ItemTable.IconId 是否存在于 ResourceTable）——后续按需扩展
+- Launch 场景启动流程（独立讨论）
